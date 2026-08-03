@@ -119,6 +119,7 @@ struct pt_filters {
  * @vmx_on:		1 if VMX is ON on this cpu
  * @output_base:	cached RTIT_OUTPUT_BASE MSR value
  * @output_mask:	cached RTIT_OUTPUT_MASK MSR value
+ * @cr3_match:		cached RTIT_CR3_MATCH MSR value
  */
 struct pt {
 	struct perf_output_handle handle;
@@ -127,6 +128,7 @@ struct pt {
 	int			vmx_on;
 	u64			output_base;
 	u64			output_mask;
+	u64			cr3_match;
 };
 
 #endif /* __INTEL_PT_H__ */

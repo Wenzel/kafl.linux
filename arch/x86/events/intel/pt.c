@@ -297,6 +297,13 @@ fail:
  */
 #define RTIT_CTL_PASSTHROUGH RTIT_CTL_TRACEEN
 
+/*
+ * IA32_RTIT_CR3_MATCH: bits 4:0 are reserved, as is everything above
+ * MAXPHYADDR. Writing a reserved bit raises #GP, so a userspace-supplied
+ * value must be checked against this mask before it reaches wrmsrl().
+ */
+#define PT_CR3_MATCH_MASK GENMASK_ULL(boot_cpu_data.x86_phys_bits - 1, 5)
+
 #define PT_CONFIG_MASK (RTIT_CTL_TRACEEN	| \
 			RTIT_CTL_TSC_EN		| \
 			RTIT_CTL_DISRETC	| \
@@ -405,6 +412,26 @@ static bool pt_event_valid(struct perf_event *event)
 			return false;
 	}
 
+
+	/*
+	 * config2 carries the IA32_RTIT_CR3_MATCH value.
+	 *
+	 * Reject it outright if the hardware cannot filter on CR3, so that
+	 * userspace never believes a filter is active when it is not.
+	 *
+	 * The MSR reserves bits 4:0 and every bit above MAXPHYADDR; writing
+	 * a reserved bit #GPs. Validate here rather than masking, so that a
+	 * bad value is a visible -EINVAL instead of silently filtering on an
+	 * address the caller did not ask for.
+	 */
+	if (event->attr.config2) {
+		if (!intel_pt_validate_hw_cap(PT_CAP_cr3_filtering))
+			return false;
+
+		if (event->attr.config2 & ~PT_CR3_MATCH_MASK)
+			return false;
+	}
+
 	return true;
 }
 
@@ -496,6 +523,29 @@ static u64 pt_config_filters(struct perf_event *event)
 	return rtit_ctl;
 }
 
+/*
+ * Program IA32_RTIT_CR3_MATCH from attr.config2 and return the CR3EN bit
+ * to be OR-ed into RTIT_CTL. Kept separate from pt_config_filters(), which
+ * returns early when the event has no address filters; CR3 filtering is
+ * independent of address filtering and must work without it.
+ */
+static u64 pt_config_cr3(struct perf_event *event)
+{
+	struct pt *pt = this_cpu_ptr(&pt_ctx);
+	u64 cr3 = event->attr.config2;
+
+	if (!intel_pt_validate_hw_cap(PT_CAP_cr3_filtering))
+		return 0;
+
+	/* avoid redundant msr writes */
+	if (pt->cr3_match != cr3) {
+		wrmsrl(MSR_IA32_RTIT_CR3_MATCH, cr3);
+		pt->cr3_match = cr3;
+	}
+
+	return cr3 ? RTIT_CTL_CR3EN : 0;
+}
+
 static void pt_config(struct perf_event *event)
 {
 	struct pt *pt = this_cpu_ptr(&pt_ctx);
@@ -509,6 +559,7 @@ static void pt_config(struct perf_event *event)
 	}
 
 	reg = pt_config_filters(event);
+	reg |= pt_config_cr3(event);
 	reg |= RTIT_CTL_TRACEEN;
 	if (!buf->single)
 		reg |= RTIT_CTL_TOPA;
