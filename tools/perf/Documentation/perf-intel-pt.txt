@@ -559,6 +559,35 @@ which contains "1" if the feature is supported and
 Start tracing paused, refer to the section <<_pause_or_resume_tracing,Pause or Resume Tracing>>
 
 
+CR3 filtering
+~~~~~~~~~~~~~
+
+Intel PT can filter trace generation by CR3, i.e. by process, using the
+IA32_RTIT_CR3_MATCH MSR. This is complementary to address-range filtering:
+an address range says which addresses executed, not which process executed
+them, so two processes sharing an address-space layout (a no-ASLR binary
+re-executed, forked children, a library mapped at the same base) are
+indistinguishable by address range alone, but are distinguishable by CR3.
+
+Support for this feature is indicated by:
+
+	/sys/bus/event_source/devices/intel_pt/caps/cr3_filtering
+
+which contains 1 if the feature is supported and 0 otherwise.
+
+CR3 filtering is programmed via perf_event_attr.config2, exposed as the
+cr3_filter format term, for example:
+
+	perf record -e intel_pt/cr3_filter=0x1a2b3000/ ...
+
+Callers of the raw perf_event_open(2) syscall, such as kAFL, can instead
+set attr.config2 directly to the same effect; the cr3_filter term is a
+thin discovery/CLI layer over that field, not a separate mechanism. A
+nonzero config2 value that is not a legal CR3 (any of bits 4:0 set, or
+any bit above the CPU's MAXPHYADDR set) is rejected with -EINVAL, in
+either case.
+
+
 config terms on other events
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
