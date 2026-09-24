@@ -120,6 +120,7 @@ PMU_FORMAT_ATTR(notnt,		"config:55"	);
 PMU_FORMAT_ATTR(mtc_period,	"config:14-17"	);
 PMU_FORMAT_ATTR(cyc_thresh,	"config:19-22"	);
 PMU_FORMAT_ATTR(psb_period,	"config:24-27"	);
+PMU_FORMAT_ATTR(cr3_filter,	"config2:0-63");
 
 static struct attribute *pt_formats_attr[] = {
 	&format_attr_pt.attr,
@@ -136,6 +137,7 @@ static struct attribute *pt_formats_attr[] = {
 	&format_attr_mtc_period.attr,
 	&format_attr_cyc_thresh.attr,
 	&format_attr_psb_period.attr,
+	&format_attr_cr3_filter.attr,
 	NULL,
 };
 
