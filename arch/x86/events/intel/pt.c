@@ -120,6 +120,7 @@ PMU_FORMAT_ATTR(notnt,		"config:55"	);
 PMU_FORMAT_ATTR(mtc_period,	"config:14-17"	);
 PMU_FORMAT_ATTR(cyc_thresh,	"config:19-22"	);
 PMU_FORMAT_ATTR(psb_period,	"config:24-27"	);
+PMU_FORMAT_ATTR(cr3_filter,	"config:7");
 
 static struct attribute *pt_formats_attr[] = {
 	&format_attr_pt.attr,
@@ -136,6 +137,7 @@ static struct attribute *pt_formats_attr[] = {
 	&format_attr_mtc_period.attr,
 	&format_attr_cyc_thresh.attr,
 	&format_attr_psb_period.attr,
+	&format_attr_cr3_filter.attr,
 	NULL,
 };
 
@@ -300,6 +302,13 @@ fail:
  */
 #define RTIT_CTL_PASSTHROUGH RTIT_CTL_TRACEEN
 
+/*
+ * IA32_RTIT_CR3_MATCH: bits 4:0 are reserved, as is everything above
+ * MAXPHYADDR. Writing a reserved bit raises #GP, so a userspace-supplied
+ * value must be checked against this mask before it reaches wrmsrq().
+ */
+#define PT_CR3_MATCH_MASK GENMASK_ULL(boot_cpu_data.x86_phys_bits - 1, 5)
+
 #define PT_CONFIG_MASK (RTIT_CTL_TRACEEN	| \
 			RTIT_CTL_TSC_EN		| \
 			RTIT_CTL_DISRETC	| \
@@ -310,7 +319,8 @@ fail:
 			RTIT_CTL_EVENT_EN	| \
 			RTIT_CTL_NOTNT		| \
 			RTIT_CTL_FUP_ON_PTW	| \
-			RTIT_CTL_PTW_EN)
+			RTIT_CTL_PTW_EN		| \
+			RTIT_CTL_CR3EN)
 
 static bool pt_event_valid(struct perf_event *event)
 {
@@ -408,6 +418,29 @@ static bool pt_event_valid(struct perf_event *event)
 			return false;
 	}
 
+	/*
+	 * cr3_filter (config bit 7, RTIT_CTL_CR3EN) opts in to CR3 filtering
+	 * and carries the IA32_RTIT_CR3_MATCH value in attr.config1. config1
+	 * is interpreted only when this bit is set; otherwise it is ignored,
+	 * so a stale or garbage config1 in a reused perf_event_attr cannot
+	 * start filtering by accident.
+	 *
+	 * Reject the request if the hardware cannot filter on CR3, so that
+	 * userspace never believes a filter is active when it is not.
+	 *
+	 * The MSR reserves bits 4:0 and every bit above MAXPHYADDR; writing
+	 * a reserved bit #GPs. Validate here rather than masking, so a bad
+	 * value is a visible -EINVAL instead of silently filtering on an
+	 * address the caller did not ask for.
+	 */
+	if (config & RTIT_CTL_CR3EN) {
+		if (!intel_pt_validate_hw_cap(PT_CAP_cr3_filtering))
+			return false;
+
+		if (event->attr.config1 & ~PT_CR3_MATCH_MASK)
+			return false;
+	}
+
 	return true;
 }
 
@@ -502,6 +535,37 @@ static u64 pt_config_filters(struct perf_event *event)
 	return rtit_ctl;
 }
 
+/*
+ * Program IA32_RTIT_CR3_MATCH from attr.config1 when CR3 filtering was
+ * requested (the cr3_filter format bit, config bit 7, RTIT_CTL_CR3EN).
+ * RTIT_CTL_CR3EN itself is set by the config passthrough in pt_config();
+ * this only loads the match value. Kept separate from pt_config_filters(),
+ * which returns early when the event has no address filters, because CR3
+ * filtering is independent of address filtering and must work without it.
+ */
+static void pt_config_cr3(struct perf_event *event)
+{
+	/*
+	 * When the opt-in bit is clear no filter was requested: skip the
+	 * write entirely. CR3EN stays clear, hardware ignores
+	 * IA32_RTIT_CR3_MATCH regardless of its contents, and existing PT
+	 * users who never set the bit pay no extra cost on every event start.
+	 */
+	if (!(event->attr.config & RTIT_CTL_CR3EN))
+		return;
+
+	/*
+	 * Write unconditionally rather than caching the value: this MSR is
+	 * not preserved across CPU offline/online or a suspend/resume cycle,
+	 * so a per-cpu cache would need explicit invalidation on those
+	 * transitions. Without it, a cache hit would skip the wrmsrq() and
+	 * leave CR3EN set with the MSR still reading 0, silently filtering on
+	 * the wrong CR3. One MSR write per event start, gated on the opt-in
+	 * bit above, is not a hot path and is paid only by filtering users.
+	 */
+	wrmsrq(MSR_IA32_RTIT_CR3_MATCH, event->attr.config1);
+}
+
 static void pt_config(struct perf_event *event)
 {
 	struct pt *pt = this_cpu_ptr(&pt_ctx);
@@ -515,6 +579,7 @@ static void pt_config(struct perf_event *event)
 	}
 
 	reg = pt_config_filters(event);
+	pt_config_cr3(event);
 	reg |= RTIT_CTL_TRACEEN;
 	if (!buf->single)
 		reg |= RTIT_CTL_TOPA;
