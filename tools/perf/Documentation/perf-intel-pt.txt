@@ -555,6 +555,69 @@ Support for this feature is indicated by:
 which contains "1" if the feature is supported and
 "0" otherwise.
 
+*cr3_filter*::
+Filter trace generation by CR3, i.e. by address space, using the
+IA32_RTIT_CR3_MATCH MSR.  The main use is a host tracing a virtual
+machine: limiting tracing to the VMM's vCPU threads still traces
+everything the guest runs, whereas matching the guest CR3 of one guest
+process drops the rest in hardware.  The CR3 value is supplied by the
+VMM, not looked up by hand.  The VMM learns which guest process to trace
+at run time, typically from a hypercall or VM exit taken in that
+process's context, reads the vCPU's CR3 at that point (e.g. with
+KVM_GET_SREGS) and passes it in when it opens the event.
++
+cr3_filter is a single enable bit (config bit 7, RTIT_CTL_CR3EN).  The
+CR3 value to match goes in perf_event_attr.config1, set with the cr3
+term, and is only consulted when the bit is set.  With the bit clear,
+config1 is ignored, so a stale value there cannot start filtering by
+accident.
++
+The hardware compares CR3 bits 63:12 (63:5 with PAE paging) and ignores
+the rest, see "Filtering by CR3" in the Intel SDM, Volume 3C.  Bits 4:0
+of the match value are reserved, so they must be clear.  A CR3 read from
+a vCPU also carries flag and PCID bits in 11:0, which are not compared
+(except bits 11:5 with PAE paging): for 32-bit, 4-level and 5-level
+paging clear bits 11:0 (for example cr3 & ~0xfffULL), and with PAE
+paging clear only bits 4:0.
++
+With page table isolation, a task runs in user mode on a different page
+table (pgd + PAGE_SIZE) than in kernel mode, so the CR3 a VMM reads
+depends on whether the guest was in user or kernel mode at the VM exit,
+and one match value covers only one of the two.
++
+The match is a plain numeric comparison of the CR3 in force, and the
+host traces the guest only with kvm_intel.pt_mode=0 (system mode, the
+default).  A guest page table that is freed and reused by another process
+matches as well, so the VMM should re-arm the event when the traced
+process execs or exits.
++
+PIP packets, which identify the CR3, are generated only when the kernel
+is traced.  With a user-only event (the u modifier) the filtered trace
+contains only the TIP.PGE and TIP.PGD packets of the matching context.
++
+Support is indicated by 1 in
+/sys/bus/event_source/devices/intel_pt/caps/cr3_filtering.
++
+The perf tool needs no changes to use this, since the cr3_filter and
+cr3 terms are read from the PMU format directory.  For example:
++
+	perf record -e intel_pt/cr3_filter,cr3=0x1a2b3000/ ...
++
+Callers of perf_event_open(2) set the bit and value directly:
++
+	attr.config  |= BIT(7);     /* RTIT_CTL_CR3EN, the cr3_filter bit */
+	attr.config1  = cr3_value;
++
+For callers that pass the privilege check described next, -EINVAL is
+returned if cr3_filter is set and the hardware lacks the capability
+above, or if config1 has any of the reserved bits 4:0 set.
++
+cr3_filter requires the same privilege as kernel tracing:
+perf_event_paranoid <= 1, or CAP_PERFMON (or CAP_SYS_ADMIN); otherwise
+-EACCES is returned, before the request is validated.  This is a conservative policy, as for the BTS
+format: probing match values until trace appears would let a caller test
+guesses of its own page table address.
+
 *aux-action=start-paused*::
 Start tracing paused, refer to the section <<_pause_or_resume_tracing,Pause or Resume Tracing>>
 
