@@ -120,6 +120,8 @@ PMU_FORMAT_ATTR(notnt,		"config:55"	);
 PMU_FORMAT_ATTR(mtc_period,	"config:14-17"	);
 PMU_FORMAT_ATTR(cyc_thresh,	"config:19-22"	);
 PMU_FORMAT_ATTR(psb_period,	"config:24-27"	);
+PMU_FORMAT_ATTR(cr3_filter,	"config:7");
+PMU_FORMAT_ATTR(cr3,		"config1:0-63");
 
 static struct attribute *pt_formats_attr[] = {
 	&format_attr_pt.attr,
@@ -136,6 +138,8 @@ static struct attribute *pt_formats_attr[] = {
 	&format_attr_mtc_period.attr,
 	&format_attr_cyc_thresh.attr,
 	&format_attr_psb_period.attr,
+	&format_attr_cr3_filter.attr,
+	&format_attr_cr3.attr,
 	NULL,
 };
 
@@ -310,7 +314,8 @@ fail:
 			RTIT_CTL_EVENT_EN	| \
 			RTIT_CTL_NOTNT		| \
 			RTIT_CTL_FUP_ON_PTW	| \
-			RTIT_CTL_PTW_EN)
+			RTIT_CTL_PTW_EN		| \
+			RTIT_CTL_CR3EN)
 
 static bool pt_event_valid(struct perf_event *event)
 {
@@ -405,6 +410,23 @@ static bool pt_event_valid(struct perf_event *event)
 		 * Disallow BRANCH_EN without the PASSTHROUGH.
 		 */
 		if (config & RTIT_CTL_BRANCH_EN)
+			return false;
+	}
+
+	/*
+	 * cr3_filter (config bit 7, RTIT_CTL_CR3EN) opts in to CR3 filtering
+	 * and attr.config1 carries the IA32_RTIT_CR3_MATCH value. config1 is
+	 * ignored unless the bit is set.
+	 *
+	 * Reject a request the hardware cannot honor, and a value with the
+	 * reserved bits 4:0 set (the MSR write would #GP) instead of masking
+	 * it, so a bad value is visible and not a filter on another CR3.
+	 */
+	if (config & RTIT_CTL_CR3EN) {
+		if (!intel_pt_validate_hw_cap(PT_CAP_cr3_filtering))
+			return false;
+
+		if (event->attr.config1 & GENMASK_ULL(4, 0))
 			return false;
 	}
 
@@ -525,6 +547,22 @@ static void pt_config_enable(struct perf_event *event)
 	WRITE_ONCE(pt->pause_allowed, 1);
 }
 
+/*
+ * Program IA32_RTIT_CR3_MATCH from attr.config1 when CR3 filtering was
+ * requested. RTIT_CTL_CR3EN itself is set by the config passthrough in
+ * pt_config(). Kept apart from pt_config_filters(), which returns early
+ * without address filters, because CR3 filtering must work without them.
+ */
+static void pt_config_cr3(struct perf_event *event)
+{
+	/* No filter requested: CR3EN stays clear and the MSR is ignored. */
+	if (!(event->attr.config & RTIT_CTL_CR3EN))
+		return;
+
+	/* Written on every event start; there is no per-CPU copy to keep. */
+	wrmsrq(MSR_IA32_RTIT_CR3_MATCH, event->attr.config1);
+}
+
 static void pt_config(struct perf_event *event)
 {
 	struct pt *pt = this_cpu_ptr(&pt_ctx);
@@ -538,6 +576,7 @@ static void pt_config(struct perf_event *event)
 	}
 
 	reg = pt_config_filters(event);
+	pt_config_cr3(event);
 	reg |= RTIT_CTL_TRACEEN;
 	if (!buf->single)
 		reg |= RTIT_CTL_TOPA;
@@ -1827,8 +1866,21 @@ static void pt_event_destroy(struct perf_event *event)
 
 static int pt_event_init(struct perf_event *event)
 {
+	int ret;
+
 	if (event->attr.type != pt_pmu.pmu.type)
 		return -ENOENT;
+
+	/*
+	 * Like bts, be conservative: probing match values until trace appears
+	 * would let a caller test guesses of its own page table address, so
+	 * require the same privilege as kernel tracing.
+	 */
+	if (event->attr.config & RTIT_CTL_CR3EN) {
+		ret = perf_allow_kernel();
+		if (ret)
+			return ret;
+	}
 
 	if (!pt_event_valid(event))
 		return -EINVAL;
